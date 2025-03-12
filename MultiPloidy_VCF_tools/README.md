@@ -6,7 +6,8 @@ These scripts were designed to deal with vcf that contain individuals with diffe
 
 ## set_hetero_haploid_to_missing
 
-This tool deals sets the heterozygous positions of haploid indivisuals to missing.
+This tool sets the heterozygous positions of haploid indivisuals to missing or prints a list with these positions that can be used for masking.
+
 Necessary inputs:
 
  * A VCF file
@@ -15,8 +16,16 @@ Necessary inputs:
   
  * The number of header lines in the vcf file.
   
-Usage: set_hetero_haploid_to_missing.py -vcf file.vcf -l list_of_haploids_in_vcf.txt -r number_of_vcf_heder_lines_minus_1
+## to set heterozygous positions to missing
+
+Usage: set_haploid_hetero_to_missing.py -vcf file.vcf -l list_of_haploids_in_vcf.txt -r number_of_vcf_heder_lines_minus_1
+
+
+## to get a list of heterozygous positions add the flag [--matt]
+
+Usage: set_haploid_hetero_to_missing.py -vcf file.vcf -l list_of_haploids_in_vcf.txt -r number_of_vcf_heder_lines_minus_1 --matt
+
 
 Comments:
 
-This script can handle multiallelic positions. However The vcf file should have only the genotype values ( bcftools query can be used to optain such a vcf file). 
+This script can handle multiallelic positions.
