@@ -16,12 +16,12 @@ Necessary inputs:
   
  * The number of header lines in the vcf file.
   
-## to set heterozygous positions to missing
+## To set heterozygous positions to missing
 
 Usage: set_haploid_hetero_to_missing.py -vcf file.vcf -l list_of_haploids_in_vcf.txt -r number_of_vcf_heder_lines_minus_1
 
 
-## to get a list of heterozygous positions add the flag [--matt]. NO CHANGES WILL BE DONE TO THE VCF FILE
+## To get a list of heterozygous positions add the flag [--matt]. NO CHANGES WILL BE DONE TO THE VCF FILE
 
 Usage: set_haploid_hetero_to_missing.py -vcf file.vcf -l list_of_haploids_in_vcf.txt -r number_of_vcf_heder_lines_minus_1 --matt
 
