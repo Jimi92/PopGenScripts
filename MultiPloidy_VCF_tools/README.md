@@ -21,11 +21,16 @@ Necessary inputs:
 Usage: set_haploid_hetero_to_missing.py -vcf file.vcf -l list_of_haploids_in_vcf.txt -r number_of_vcf_heder_lines_minus_1
 
 
-## to get a list of heterozygous positions add the flag [--matt]
+## to get a list of heterozygous positions add the flag [--matt]. NO CHANGES WILL BE DONE TO THE VCF FILE
 
 Usage: set_haploid_hetero_to_missing.py -vcf file.vcf -l list_of_haploids_in_vcf.txt -r number_of_vcf_heder_lines_minus_1 --matt
 
 
+
+## [--AD]: Combine the --matt flag with --AD to use the Allele depth, rather than the GT field to determine heterozygous sites. Particularly usefull if your males are encoded as haploid in your VCF file. NO CHANGES WILL BE DONE TO THE VCF FILE, just a list will be printed.
+
 Comments:
 
 This script can handle multiallelic positions.
+
+If something is wrong please sent an email at demetris.taliadoros@imbim.uu.se
