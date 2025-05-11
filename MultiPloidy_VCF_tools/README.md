@@ -37,4 +37,4 @@ Comments:
 
 This script can handle multiallelic positions.
 
-If something is wrong please sent an email at demetris.taliadoros@imbim.uu.se
+If something is wrong please send an email at demetris.taliadoros@imbim.uu.se
