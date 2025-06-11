@@ -114,7 +114,11 @@ def infer_queen_genotypes(vcf, droneID, queenID, header_lines, threshold):
 
 queen_vcf, headers = infer_queen_genotypes(vcf, droneID, queenID, header_lines, args.heterozygot_thres)
 
-output_vcf = args.vcf.replace('.vcf', '_queens.vcf').replace('.vcf.gz', 'GT_imputed.vcf')
+# Reconstruct the #CHROM header line with queen sample names
+new_sample_header = '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t' + '\t'.join(queen_vcf.columns[9:]) + '\n'
+headers[-1] = new_sample_header  # Replace the old sample header line
+
+output_vcf = args.vcf.replace('.vcf', '_queens.vcf').replace('.vcf.gz', 'GT_inferred.vcf')
 with open(output_vcf, 'w') as out_vcf:
     out_vcf.writelines(headers)
     queen_vcf.to_csv(out_vcf, sep='\t', index=False, header=False)
