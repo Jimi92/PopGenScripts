@@ -14,7 +14,7 @@ Necessary inputs:
 
  * A list of the haploid individuals in the vcf file. One individual per line.
   
- * The number of header lines in the vcf file.
+ * The number of header lines in the vcf file minus 1.
   
 ## To set heterozygous positions to missing
 
