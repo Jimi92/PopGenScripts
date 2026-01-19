@@ -6,10 +6,12 @@
 # >><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>>
 
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 This tool sets heterozygous positions of haploid individuals to missing.
 Written by Demetris Taliadoros. Last update 22/03/2024
-Updated: multi-allelic AD support + bgzip/gzip VCF reading + robust AD parsing via FORMAT.
+Updated: multi-allelic AD support + bgzip/gzip VCF reading + robust AD parsing via FORMAT
+Update2: In --AD mode, ignore positions where any AD value is 0
 """
 
 import pandas as pd
@@ -58,7 +60,6 @@ def is_het_from_gt(cell: str) -> bool:
         return False
     gt = cell.split(":", 1)[0]
     alleles = set(re.split(r"[|/]", gt))
-    # ignore missing tokens
     alleles.discard(".")
     return len(alleles) > 1
 
@@ -76,13 +77,12 @@ def parse_ad_from_row(format_str: str, sample_str: str) -> Optional[List[int]]:
     fmt_keys = format_str.split(":")
     vals = sample_str.split(":")
     if len(vals) < len(fmt_keys):
-        # Some VCFs truncate trailing missing fields; handle safely by padding.
         vals = vals + [""] * (len(fmt_keys) - len(vals))
 
     try:
         ad_idx = fmt_keys.index("AD")
     except ValueError:
-        return None  # AD not present in FORMAT
+        return None
 
     ad_raw = vals[ad_idx]
     if not ad_raw or ad_raw == ".":
@@ -99,8 +99,8 @@ def parse_ad_from_row(format_str: str, sample_str: str) -> Optional[List[int]]:
             return None
 
     if len(depths) < 2:
-        # AD should usually have at least ref + one alt
         return None
+
     return depths
 
 
@@ -109,22 +109,25 @@ def ad_has_alt_balanced_against_ref(ad_depths: List[int], low: float = 0.2, high
     Multi-allelic aware rule:
     Compare each ALT depth against REF depth.
 
-    - ad_depths = [ref, alt1, alt2, ...]
-    - If ref > 0: compute alt/ref ratio for each alt; if any ratio in [low, high] => flag
-    - If ref == 0: if any alt > 0 => flag (since ratio undefined but evidence of non-ref)
+    NEW RULE:
+    If ANY AD value is 0 (REF or any ALT), ignore the position entirely.
     """
+    # >>> NEW RULE HERE <<<
+    if any(d == 0 for d in ad_depths):
+        return False
+
     ref = ad_depths[0]
     alts = ad_depths[1:]
 
+    # ref cannot be 0 here due to the rule above, but keeping safe:
     if ref <= 0:
-        return any(a > 0 for a in alts)
+        return False
 
     for alt in alts:
-        if alt <= 0:
-            continue
         ratio = alt / ref
         if low <= ratio <= high:
             return True
+
     return False
 
 
@@ -142,7 +145,6 @@ def find_heterozygous_positions_gt(df: pd.DataFrame, individuals: List[str]) -> 
 
 def find_positions_ad(df: pd.DataFrame, individuals: List[str], low: float = 0.2, high: float = 1.8) -> pd.DataFrame:
     ad_positions = []
-    # We use the row's FORMAT column to locate AD for each sample.
     if "FORMAT" not in df.columns:
         raise ValueError("VCF body is missing FORMAT column; cannot use --AD mode.")
 
@@ -152,6 +154,7 @@ def find_positions_ad(df: pd.DataFrame, individuals: List[str], low: float = 0.2
             ad = parse_ad_from_row(fmt, sample_cell)
             if ad is None:
                 continue
+
             if ad_has_alt_balanced_against_ref(ad, low=low, high=high):
                 ad_positions.append([df.at[idx, "#CHROM"], df.at[idx, "POS"]])
 
@@ -161,8 +164,8 @@ def find_positions_ad(df: pd.DataFrame, individuals: List[str], low: float = 0.2
 def set_positions_to_missing(df: pd.DataFrame, individuals: List[str], use_ad: bool, low: float = 0.2, high: float = 1.8) -> None:
     """
     Set flagged haploid sample genotypes to missing:
-    - If use_ad: flag rows where AD indicates alt depth balanced vs ref depth (multi-allelic aware)
-    - Else: flag rows where GT is heterozygous (contains >1 distinct allele)
+    - If use_ad: flag rows where AD indicates alt depth balanced vs ref depth
+    - Else: flag rows where GT is heterozygous
     """
     if use_ad and "FORMAT" not in df.columns:
         raise ValueError("VCF body is missing FORMAT column; cannot use --AD mode.")
@@ -201,24 +204,24 @@ def main():
 
     args = parser.parse_args()
 
-    # Read header lines (works for plain and gz/bgzip)
+    # Read VCF header lines
     with open_maybe_gzip(args.vcf, "rt") as vcf_file:
         header_lines = [next(vcf_file) for _ in range(args.rownum + 1)]
 
-    # Read body table
+    # Read VCF body
     vcf = pandas_read_vcf_table(args.vcf, skiprows=args.rownum)
 
-    # Read haploid individual list
+    # Read haploid list
     with open(args.list, "r") as f:
         haploid_individuals = set(f.read().splitlines())
 
-    # Ensure individuals exist in the VCF
+    # Keep only samples that exist
     haploid_individuals = [ind for ind in haploid_individuals if ind in vcf.columns]
     if not haploid_individuals:
         print("Error: No valid haploid individuals found in VCF. Exiting.")
         raise SystemExit(1)
 
-    # If --matt specified: output positions only
+    # --matt: output flagged positions only
     if args.matt:
         if args.AD:
             positions = find_positions_ad(vcf, haploid_individuals, low=args.low, high=args.high)
@@ -232,7 +235,7 @@ def main():
             print(f"Heterozygous positions saved as {out}")
         raise SystemExit(0)
 
-    # Modify and write VCF (output is uncompressed .vcf)
+    # Modify VCF
     set_positions_to_missing(vcf, haploid_individuals, use_ad=args.AD, low=args.low, high=args.high)
 
     output_vcf = re.sub(r"(\.vcf)(\.(gz|bgz|bgzip))?$", r"_modified.vcf", args.vcf, flags=re.IGNORECASE)
@@ -245,4 +248,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
