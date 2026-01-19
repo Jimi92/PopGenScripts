@@ -63,7 +63,7 @@ def find_AD_outliers(df, individuals):
                             AD1, AD2 = map(int, ad_values.split(","))
                             if AD1 > 0:  # Avoid division by zero
                                 ratio = AD2 / AD1
-                                if 0.6 <= ratio <= 1.4:  # Check ratio
+                                if 0.2 <= ratio <= 1.8:  # Check ratio
                                     ad_positions.append([df.at[index, "#CHROM"], df.at[index, "POS"]])
                         except ValueError:
                             continue  # Skip invalid entries
