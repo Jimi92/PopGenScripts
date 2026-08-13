@@ -2,6 +2,7 @@
 
 # >><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>>
 # This tool sets heterozygous positions of haploid individuals to missing.
+#
 # Optimized streaming version:
 #   - No pandas
 #   - Low-memory streaming
@@ -10,6 +11,7 @@
 #   - Ignores AD positions where ANY AD value is zero
 #   - Reads plain VCF / gzip / bgzip
 #   - Writes proper multithreaded BGZF VCF output
+#   - Fast tqdm progress bar with batched updates
 # >><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>><<>>
 
 import argparse
@@ -19,7 +21,9 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Optional, List, Dict, TextIO
+from typing import Optional, List, Dict
+
+from tqdm import tqdm
 
 
 # =============================================================================
@@ -52,8 +56,6 @@ def make_output_filename(input_vcf: str, suffix: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # If the filename didn't match the usual VCF endings, still create
-    # a sensible output filename.
     if base == input_vcf:
         base = input_vcf
 
@@ -62,10 +64,9 @@ def make_output_filename(input_vcf: str, suffix: str) -> str:
 
 class BgzipWriter:
     """
-    Context manager for writing proper BGZF output via the external
-    bgzip executable.
+    Context manager for writing proper BGZF output through bgzip.
 
-    Text is written to .write(), encoded to bytes, then sent to bgzip.
+    Requires bgzip to be installed and available in PATH.
     """
 
     def __init__(self, path: str, threads: int = 4):
@@ -75,6 +76,7 @@ class BgzipWriter:
         self.process = None
 
     def __enter__(self):
+
         if shutil.which("bgzip") is None:
             raise RuntimeError(
                 "bgzip was not found in PATH.\n"
@@ -103,12 +105,15 @@ class BgzipWriter:
         return self
 
     def write(self, text: str):
+
         if self.process is None or self.process.stdin is None:
             raise RuntimeError("BGZF writer is not open.")
 
         try:
             self.process.stdin.write(text.encode("utf-8"))
+
         except BrokenPipeError:
+
             stderr = ""
 
             if self.process.stderr is not None:
@@ -123,6 +128,7 @@ class BgzipWriter:
             )
 
     def __exit__(self, exc_type, exc_value, traceback):
+
         if self.process is None:
             return False
 
@@ -142,13 +148,15 @@ class BgzipWriter:
         if self.output_handle is not None:
             self.output_handle.close()
 
-        # If Python itself raised an exception, don't replace it with
-        # a secondary bgzip error unless necessary.
         if exc_type is not None:
             return False
 
         if return_code != 0:
-            stderr = stderr_data.decode("utf-8", errors="replace")
+
+            stderr = stderr_data.decode(
+                "utf-8",
+                errors="replace",
+            )
 
             raise RuntimeError(
                 f"bgzip failed with exit code {return_code}.\n"
@@ -156,6 +164,61 @@ class BgzipWriter:
             )
 
         return False
+
+
+# =============================================================================
+# Progress bar
+# =============================================================================
+
+class VariantProgress:
+    """
+    Low-overhead tqdm progress bar.
+
+    Instead of calling tqdm.update() for every variant, updates are accumulated
+    and sent to tqdm in batches.
+
+    This keeps progress-bar overhead negligible even for tens/hundreds of
+    millions of variants.
+    """
+
+    def __init__(self, batch_size: int = 10000):
+
+        self.batch_size = batch_size
+        self.pending = 0
+
+        self.bar = tqdm(
+            desc="Processing variants",
+            unit=" variants",
+            unit_scale=True,
+            dynamic_ncols=True,
+            mininterval=0.5,
+            smoothing=0.1,
+        )
+
+    def update(self):
+
+        self.pending += 1
+
+        if self.pending >= self.batch_size:
+            self.bar.update(self.pending)
+            self.pending = 0
+
+    def set_postfix(self, **kwargs):
+        """
+        Update additional information displayed on the progress bar.
+        """
+        self.bar.set_postfix(
+            kwargs,
+            refresh=False,
+        )
+
+    def close(self):
+
+        if self.pending:
+            self.bar.update(self.pending)
+            self.pending = 0
+
+        self.bar.close()
 
 
 # =============================================================================
@@ -182,15 +245,11 @@ def is_het_gt(sample: str) -> bool:
         .
         ./.
         .|.
-
-    GT is expected to be the first FORMAT/sample subfield, as required
-    by the VCF specification when GT is present.
     """
 
     if not sample:
         return False
 
-    # Avoid splitting all FORMAT fields.
     colon = sample.find(":")
 
     if colon == -1:
@@ -200,37 +259,43 @@ def is_het_gt(sample: str) -> bool:
 
     if "/" in gt:
         alleles = gt.split("/")
+
     elif "|" in gt:
         alleles = gt.split("|")
+
     else:
-        # Haploid GT or missing genotype.
+        # Haploid or missing GT.
         return False
 
     observed = set()
 
     for allele in alleles:
+
         if allele != "." and allele != "":
             observed.add(allele)
 
-            # No need to continue once two alleles have been observed.
+            # Stop immediately once two different alleles are observed.
             if len(observed) > 1:
                 return True
 
     return False
 
 
-def set_gt_missing(sample: str, haploid_missing: bool = False) -> str:
+def set_gt_missing(
+    sample: str,
+    haploid_missing: bool = False,
+) -> str:
     """
-    Replace GT with missing while keeping every other FORMAT value.
+    Replace GT with missing while retaining all other FORMAT values.
 
     Default:
         0/1:10,8:18
-          ->
+        ->
         ./.:10,8:18
 
-    With haploid_missing=True:
+    --haploid-missing:
         0/1:10,8:18
-          ->
+        ->
         .:10,8:18
     """
 
@@ -255,18 +320,17 @@ def get_ad_index(
     """
     Return the position of AD within FORMAT.
 
-    FORMAT strings repeat extensively within VCFs, so cache the result.
+    FORMAT strings repeat extensively within VCF files, so cache the result.
     """
 
-    cached = cache.get(format_string, "__NOT_CACHED__")
-
-    if cached != "__NOT_CACHED__":
-        return cached
+    if format_string in cache:
+        return cache[format_string]
 
     format_fields = format_string.split(":")
 
     try:
         index = format_fields.index("AD")
+
     except ValueError:
         index = None
 
@@ -285,16 +349,13 @@ def parse_ad(
     Returns:
         [REF, ALT1, ALT2, ...]
 
-    Examples:
-        sample = "0/1:23,17:40"
-        AD index = 1
-        -> [23, 17]
+    Example:
+        FORMAT = GT:AD:DP
+        sample = 0/1:23,17:40
 
-        sample = "0/2:20,3,15:38"
-        -> [20, 3, 15]
+        -> [23, 17]
     """
 
-    # split() is needed here because AD can be located anywhere in FORMAT.
     values = sample.split(":")
 
     if ad_index >= len(values):
@@ -313,11 +374,13 @@ def parse_ad(
     depths = []
 
     for value in parts:
+
         if value == "" or value == ".":
             return None
 
         try:
             depth = int(value)
+
         except ValueError:
             return None
 
@@ -333,28 +396,35 @@ def ad_is_balanced(
     high: float,
 ) -> bool:
     """
-    Determine whether an ALT allele has an AD depth balanced against REF.
+    Determine whether any ALT allele is balanced against REF.
 
-    Rule:
         low <= ALT / REF <= high
 
-    Multi-allelic sites:
-        Every ALT is tested against REF individually.
+    Multi-allelic AD is supported.
 
     IMPORTANT:
-        If ANY AD value equals zero, the entire sample/position is ignored,
-        preserving the requested behaviour.
+        If ANY AD value equals zero, the sample is ignored.
 
-    Example:
-        AD = 20,12
-        ratio = 12/20 = 0.60
-        -> flagged if low=0.2 and high=1.8
+    Examples:
 
-        AD = 20,0,12
-        -> NOT flagged because one AD value is zero
+        20,10
+        -> ratio 0.5
+        -> evaluated normally
+
+        20,0
+        -> ignored
+
+        20,10,0
+        -> ignored
+
+        0,20
+        -> ignored
     """
 
-    depths = parse_ad(sample, ad_index)
+    depths = parse_ad(
+        sample,
+        ad_index,
+    )
 
     if depths is None:
         return False
@@ -369,6 +439,7 @@ def ad_is_balanced(
         return False
 
     for alt in depths[1:]:
+
         ratio = alt / ref
 
         if low <= ratio <= high:
@@ -378,7 +449,7 @@ def ad_is_balanced(
 
 
 # =============================================================================
-# Input sample list
+# Sample list
 # =============================================================================
 
 def read_haploid_samples(path: str) -> set:
@@ -389,7 +460,9 @@ def read_haploid_samples(path: str) -> set:
     samples = set()
 
     with open(path, "r") as handle:
+
         for line in handle:
+
             sample = line.strip()
 
             if sample:
@@ -407,21 +480,22 @@ def write_positions(
     wanted_samples: set,
 ):
     """
-    Stream through VCF and write flagged CHROM/POS positions.
+    Stream VCF and output only flagged CHROM/POS positions.
 
-    No variants are stored in memory.
+    The VCF itself is NOT modified.
 
-    As soon as one haploid individual flags a variant, the remaining
-    individuals are skipped because --matt only needs one output record
-    per genomic position.
+    When one haploid sample flags a position, remaining samples are skipped.
     """
 
     if args.AD:
+
         output = make_output_filename(
             args.vcf,
             "_AD_positions.txt",
         )
+
     else:
+
         output = make_output_filename(
             args.vcf,
             "_het_positions.txt",
@@ -429,126 +503,177 @@ def write_positions(
 
     sample_indices = None
     found_samples = []
+
     ad_cache: Dict[str, Optional[int]] = {}
 
     variants = 0
     flagged = 0
 
-    with open_maybe_gzip(args.vcf, "rt") as infile, \
-            open(output, "w") as outfile:
+    progress = None
 
-        outfile.write("#CHROM\tPOS\n")
+    try:
 
-        for line in infile:
+        with open_maybe_gzip(args.vcf, "rt") as infile, \
+                open(output, "w") as outfile:
 
-            if line.startswith("##"):
-                continue
+            outfile.write("#CHROM\tPOS\n")
 
-            if line.startswith("#CHROM"):
-                columns = line.rstrip("\r\n").split("\t")
+            for line in infile:
 
-                if len(columns) < 10:
-                    raise RuntimeError(
-                        "VCF does not contain sample columns."
-                    )
+                # ---------------------------------------------------------
+                # Header
+                # ---------------------------------------------------------
 
-                sample_indices = []
-                found_samples = []
-
-                for index in range(9, len(columns)):
-                    sample = columns[index]
-
-                    if sample in wanted_samples:
-                        sample_indices.append(index)
-                        found_samples.append(sample)
-
-                if not sample_indices:
-                    raise RuntimeError(
-                        "None of the individuals in the haploid list "
-                        "were found in the VCF."
-                    )
-
-                print(
-                    f"Found {len(found_samples)} haploid individual(s) "
-                    f"in the VCF.",
-                    file=sys.stderr,
-                )
-
-                continue
-
-            if line.startswith("#"):
-                continue
-
-            if sample_indices is None:
-                raise RuntimeError(
-                    "Could not find the #CHROM VCF header line."
-                )
-
-            variants += 1
-
-            fields = line.rstrip("\r\n").split("\t")
-
-            # Protect against malformed rows.
-            if len(fields) <= max(sample_indices):
-                continue
-
-            is_flagged = False
-
-            if args.AD:
-                if len(fields) < 9:
+                if line.startswith("##"):
                     continue
 
-                format_string = fields[8]
+                if line.startswith("#CHROM"):
 
-                ad_index = get_ad_index(
-                    format_string,
-                    ad_cache,
-                )
+                    columns = line.rstrip("\r\n").split("\t")
 
-                if ad_index is not None:
+                    if len(columns) < 10:
+                        raise RuntimeError(
+                            "VCF does not contain sample columns."
+                        )
+
+                    sample_indices = []
+                    found_samples = []
+
+                    for index in range(9, len(columns)):
+
+                        sample = columns[index]
+
+                        if sample in wanted_samples:
+                            sample_indices.append(index)
+                            found_samples.append(sample)
+
+                    if not sample_indices:
+                        raise RuntimeError(
+                            "None of the individuals in the haploid list "
+                            "were found in the VCF."
+                        )
+
+                    print(
+                        f"Found {len(found_samples)} haploid individual(s) "
+                        f"in the VCF.",
+                        file=sys.stderr,
+                    )
+
+                    # Start tqdm only after the VCF header has been parsed.
+                    progress = VariantProgress(
+                        batch_size=args.progress_batch,
+                    )
+
+                    continue
+
+                if line.startswith("#"):
+                    continue
+
+                if sample_indices is None:
+                    raise RuntimeError(
+                        "Could not find the #CHROM VCF header line."
+                    )
+
+                # ---------------------------------------------------------
+                # Variant
+                # ---------------------------------------------------------
+
+                variants += 1
+
+                if progress is not None:
+                    progress.update()
+
+                fields = line.rstrip("\r\n").split("\t")
+
+                if len(fields) <= max(sample_indices):
+                    continue
+
+                is_flagged = False
+
+                # ---------------------------------------------------------
+                # AD mode
+                # ---------------------------------------------------------
+
+                if args.AD:
+
+                    if len(fields) < 9:
+                        continue
+
+                    format_string = fields[8]
+
+                    ad_index = get_ad_index(
+                        format_string,
+                        ad_cache,
+                    )
+
+                    if ad_index is not None:
+
+                        for column_index in sample_indices:
+
+                            if ad_is_balanced(
+                                fields[column_index],
+                                ad_index,
+                                args.low,
+                                args.high,
+                            ):
+
+                                is_flagged = True
+
+                                # --matt only needs one match per position.
+                                break
+
+                # ---------------------------------------------------------
+                # GT mode
+                # ---------------------------------------------------------
+
+                else:
+
                     for column_index in sample_indices:
-                        if ad_is_balanced(
-                            fields[column_index],
-                            ad_index,
-                            args.low,
-                            args.high,
-                        ):
-                            is_flagged = True
 
-                            # Major optimization for --matt:
-                            # one positive individual is sufficient.
+                        if is_het_gt(
+                            fields[column_index]
+                        ):
+
+                            is_flagged = True
                             break
 
-            else:
-                for column_index in sample_indices:
-                    if is_het_gt(fields[column_index]):
-                        is_flagged = True
-                        break
+                # ---------------------------------------------------------
+                # Output
+                # ---------------------------------------------------------
 
-            if is_flagged:
-                outfile.write(
-                    f"{fields[0]}\t{fields[1]}\n"
-                )
-                flagged += 1
+                if is_flagged:
 
-            if (
-                args.progress > 0
-                and variants % args.progress == 0
-            ):
-                print(
-                    f"Processed {variants:,} variants; "
-                    f"flagged {flagged:,}",
-                    file=sys.stderr,
-                )
+                    outfile.write(
+                        f"{fields[0]}\t{fields[1]}\n"
+                    )
+
+                    flagged += 1
+
+                # Updating postfix only occasionally avoids terminal overhead.
+                if (
+                    progress is not None
+                    and variants % args.status_interval == 0
+                ):
+
+                    progress.set_postfix(
+                        flagged=f"{flagged:,}"
+                    )
+
+    finally:
+
+        if progress is not None:
+            progress.close()
 
     print(
-        f"Processed {variants:,} variants.",
+        f"\nProcessed {variants:,} variants.",
         file=sys.stderr,
     )
+
     print(
         f"Flagged {flagged:,} positions.",
         file=sys.stderr,
     )
+
     print(
         f"Positions saved as: {output}",
         file=sys.stderr,
@@ -564,8 +689,8 @@ def write_modified_vcf(
     wanted_samples: set,
 ):
     """
-    Stream the VCF, modify selected sample GTs, and write proper
-    BGZF-compressed VCF output.
+    Stream VCF, modify selected sample GTs, and write proper
+    BGZF-compressed output.
     """
 
     output = make_output_filename(
@@ -582,159 +707,185 @@ def write_modified_vcf(
     modified_genotypes = 0
     modified_positions = 0
 
-    with open_maybe_gzip(args.vcf, "rt") as infile, \
-            BgzipWriter(output, threads=args.threads) as outfile:
+    progress = None
 
-        for line in infile:
+    try:
 
-            # -------------------------------------------------------------
-            # VCF metadata
-            # -------------------------------------------------------------
+        with open_maybe_gzip(args.vcf, "rt") as infile, \
+                BgzipWriter(
+                    output,
+                    threads=args.threads,
+                ) as outfile:
 
-            if line.startswith("##"):
-                outfile.write(line)
-                continue
+            for line in infile:
 
-            # -------------------------------------------------------------
-            # Main VCF header
-            # -------------------------------------------------------------
+                # ---------------------------------------------------------
+                # Metadata
+                # ---------------------------------------------------------
 
-            if line.startswith("#CHROM"):
-                columns = line.rstrip("\r\n").split("\t")
+                if line.startswith("##"):
+                    outfile.write(line)
+                    continue
 
-                if len(columns) < 10:
-                    raise RuntimeError(
-                        "VCF does not contain sample columns."
-                    )
+                # ---------------------------------------------------------
+                # Main VCF header
+                # ---------------------------------------------------------
 
-                sample_indices = []
-                found_samples = []
+                if line.startswith("#CHROM"):
 
-                for index in range(9, len(columns)):
-                    sample = columns[index]
+                    columns = line.rstrip("\r\n").split("\t")
 
-                    if sample in wanted_samples:
-                        sample_indices.append(index)
-                        found_samples.append(sample)
-
-                if not sample_indices:
-                    raise RuntimeError(
-                        "None of the individuals in the haploid list "
-                        "were found in the VCF."
-                    )
-
-                print(
-                    f"Found {len(found_samples)} haploid individual(s) "
-                    f"in the VCF.",
-                    file=sys.stderr,
-                )
-
-                outfile.write(line)
-
-                continue
-
-            # Preserve any unusual additional header lines.
-            if line.startswith("#"):
-                outfile.write(line)
-                continue
-
-            if sample_indices is None:
-                raise RuntimeError(
-                    "Could not find the #CHROM VCF header line."
-                )
-
-            # -------------------------------------------------------------
-            # Variant
-            # -------------------------------------------------------------
-
-            variants += 1
-
-            fields = line.rstrip("\r\n").split("\t")
-
-            if len(fields) <= max(sample_indices):
-                # Preserve malformed/unexpected rows rather than silently
-                # discarding them.
-                outfile.write(line)
-                continue
-
-            position_modified = False
-
-            # -------------------------------------------------------------
-            # AD MODE
-            # -------------------------------------------------------------
-
-            if args.AD:
-                if len(fields) >= 9:
-                    format_string = fields[8]
-
-                    ad_index = get_ad_index(
-                        format_string,
-                        ad_cache,
-                    )
-
-                    if ad_index is not None:
-
-                        for column_index in sample_indices:
-
-                            sample = fields[column_index]
-
-                            if ad_is_balanced(
-                                sample,
-                                ad_index,
-                                args.low,
-                                args.high,
-                            ):
-                                fields[column_index] = set_gt_missing(
-                                    sample,
-                                    haploid_missing=args.haploid_missing,
-                                )
-
-                                modified_genotypes += 1
-                                position_modified = True
-
-            # -------------------------------------------------------------
-            # GT MODE
-            # -------------------------------------------------------------
-
-            else:
-
-                for column_index in sample_indices:
-
-                    sample = fields[column_index]
-
-                    if is_het_gt(sample):
-                        fields[column_index] = set_gt_missing(
-                            sample,
-                            haploid_missing=args.haploid_missing,
+                    if len(columns) < 10:
+                        raise RuntimeError(
+                            "VCF does not contain sample columns."
                         )
 
-                        modified_genotypes += 1
-                        position_modified = True
+                    sample_indices = []
+                    found_samples = []
 
-            if position_modified:
-                modified_positions += 1
+                    for index in range(9, len(columns)):
 
-            outfile.write(
-                "\t".join(fields) + "\n"
-            )
+                        sample = columns[index]
 
-            # -------------------------------------------------------------
-            # Lightweight progress reporting
-            # -------------------------------------------------------------
+                        if sample in wanted_samples:
 
-            if (
-                args.progress > 0
-                and variants % args.progress == 0
-            ):
-                print(
-                    f"Processed {variants:,} variants; "
-                    f"modified {modified_genotypes:,} genotypes "
-                    f"at {modified_positions:,} positions.",
-                    file=sys.stderr,
+                            sample_indices.append(index)
+                            found_samples.append(sample)
+
+                    if not sample_indices:
+                        raise RuntimeError(
+                            "None of the individuals in the haploid list "
+                            "were found in the VCF."
+                        )
+
+                    print(
+                        f"Found {len(found_samples)} haploid individual(s) "
+                        f"in the VCF.",
+                        file=sys.stderr,
+                    )
+
+                    outfile.write(line)
+
+                    progress = VariantProgress(
+                        batch_size=args.progress_batch,
+                    )
+
+                    continue
+
+                # Preserve unusual header lines.
+                if line.startswith("#"):
+                    outfile.write(line)
+                    continue
+
+                if sample_indices is None:
+                    raise RuntimeError(
+                        "Could not find the #CHROM VCF header line."
+                    )
+
+                # ---------------------------------------------------------
+                # Variant
+                # ---------------------------------------------------------
+
+                variants += 1
+
+                if progress is not None:
+                    progress.update()
+
+                fields = line.rstrip("\r\n").split("\t")
+
+                if len(fields) <= max(sample_indices):
+
+                    # Preserve malformed/unexpected rows.
+                    outfile.write(line)
+                    continue
+
+                position_modified = False
+
+                # ---------------------------------------------------------
+                # AD mode
+                # ---------------------------------------------------------
+
+                if args.AD:
+
+                    if len(fields) >= 9:
+
+                        format_string = fields[8]
+
+                        ad_index = get_ad_index(
+                            format_string,
+                            ad_cache,
+                        )
+
+                        if ad_index is not None:
+
+                            for column_index in sample_indices:
+
+                                sample = fields[column_index]
+
+                                if ad_is_balanced(
+                                    sample,
+                                    ad_index,
+                                    args.low,
+                                    args.high,
+                                ):
+
+                                    fields[column_index] = set_gt_missing(
+                                        sample,
+                                        haploid_missing=args.haploid_missing,
+                                    )
+
+                                    modified_genotypes += 1
+                                    position_modified = True
+
+                # ---------------------------------------------------------
+                # GT mode
+                # ---------------------------------------------------------
+
+                else:
+
+                    for column_index in sample_indices:
+
+                        sample = fields[column_index]
+
+                        if is_het_gt(sample):
+
+                            fields[column_index] = set_gt_missing(
+                                sample,
+                                haploid_missing=args.haploid_missing,
+                            )
+
+                            modified_genotypes += 1
+                            position_modified = True
+
+                if position_modified:
+                    modified_positions += 1
+
+                # ---------------------------------------------------------
+                # Output
+                # ---------------------------------------------------------
+
+                outfile.write(
+                    "\t".join(fields) + "\n"
                 )
 
+                # Update displayed stats occasionally, not every record.
+                if (
+                    progress is not None
+                    and variants % args.status_interval == 0
+                ):
+
+                    progress.set_postfix(
+                        positions=f"{modified_positions:,}",
+                        genotypes=f"{modified_genotypes:,}",
+                    )
+
+    finally:
+
+        if progress is not None:
+            progress.close()
+
     print(
-        f"Processed {variants:,} variants.",
+        f"\nProcessed {variants:,} variants.",
         file=sys.stderr,
     )
 
@@ -759,8 +910,8 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Set heterozygous/balanced positions of specified haploid "
-            "individuals to missing in a VCF. Uses streaming processing "
-            "and writes proper BGZF-compressed VCF output."
+            "individuals to missing in a VCF. Uses low-memory streaming "
+            "processing and optionally writes proper BGZF output."
         )
     )
 
@@ -769,7 +920,7 @@ def main():
         "--vcf",
         required=True,
         help=(
-            "Input VCF. Supported: .vcf, .vcf.gz, .vcf.bgz, .vcf.bgzip"
+            "Input VCF: .vcf, .vcf.gz, .vcf.bgz or .vcf.bgzip"
         ),
     )
 
@@ -782,16 +933,14 @@ def main():
         ),
     )
 
-    # Retained so old command lines using -r do not fail.
-    # It is deliberately ignored because header detection is automatic.
+    # Kept for compatibility with old commands.
     parser.add_argument(
         "-r",
         "--rownum",
         type=int,
         required=False,
         help=(
-            "Deprecated and ignored. VCF header rows are now detected "
-            "automatically."
+            "Deprecated and ignored. VCF headers are detected automatically."
         ),
     )
 
@@ -800,7 +949,7 @@ def main():
         action="store_true",
         help=(
             "Only output flagged CHROM/POS positions. "
-            "Do not create a modified VCF."
+            "Do not modify or create a VCF."
         ),
     )
 
@@ -843,13 +992,23 @@ def main():
     )
 
     parser.add_argument(
-        "--progress",
+        "--progress-batch",
         type=int,
-        default=1_000_000,
+        default=10000,
         help=(
-            "Print progress every N variants. "
-            "Use 0 to disable progress messages "
-            "(default: 1000000)."
+            "Update tqdm internally every N variants. "
+            "Larger values reduce progress-bar overhead. "
+            "Default: 10000."
+        ),
+    )
+
+    parser.add_argument(
+        "--status-interval",
+        type=int,
+        default=100000,
+        help=(
+            "Update flagged/modified statistics shown beside the "
+            "progress bar every N variants. Default: 100000."
         ),
     )
 
@@ -857,28 +1016,38 @@ def main():
         "--haploid-missing",
         action="store_true",
         help=(
-            "Write missing GT as '.' instead of './.'. "
-            "Use this for strictly haploid VCF representation."
+            "Write missing GT as '.' instead of './.'."
         ),
     )
 
     args = parser.parse_args()
 
     # ---------------------------------------------------------------------
-    # Validate options
+    # Validate arguments
     # ---------------------------------------------------------------------
 
     if args.low < 0:
         parser.error("--low cannot be negative.")
 
     if args.high < args.low:
-        parser.error("--high must be greater than or equal to --low.")
+        parser.error(
+            "--high must be greater than or equal to --low."
+        )
 
     if args.threads < 1:
-        parser.error("--threads must be at least 1.")
+        parser.error(
+            "--threads must be at least 1."
+        )
 
-    if args.progress < 0:
-        parser.error("--progress cannot be negative.")
+    if args.progress_batch < 1:
+        parser.error(
+            "--progress-batch must be at least 1."
+        )
+
+    if args.status_interval < 1:
+        parser.error(
+            "--status-interval must be at least 1."
+        )
 
     if not os.path.isfile(args.vcf):
         parser.error(
@@ -897,10 +1066,12 @@ def main():
         )
 
     # ---------------------------------------------------------------------
-    # Read haploid sample IDs
+    # Haploid sample list
     # ---------------------------------------------------------------------
 
-    wanted_samples = read_haploid_samples(args.list)
+    wanted_samples = read_haploid_samples(
+        args.list
+    )
 
     if not wanted_samples:
         parser.error(
@@ -914,15 +1085,18 @@ def main():
     )
 
     # ---------------------------------------------------------------------
-    # Process
+    # Run
     # ---------------------------------------------------------------------
 
     if args.matt:
+
         write_positions(
             args,
             wanted_samples,
         )
+
     else:
+
         write_modified_vcf(
             args,
             wanted_samples,
@@ -930,19 +1104,25 @@ def main():
 
 
 if __name__ == "__main__":
+
     try:
+
         main()
 
     except KeyboardInterrupt:
+
         print(
             "\nInterrupted by user.",
             file=sys.stderr,
         )
+
         sys.exit(130)
 
     except Exception as exc:
+
         print(
             f"\nERROR: {exc}",
             file=sys.stderr,
         )
+
         sys.exit(1)
